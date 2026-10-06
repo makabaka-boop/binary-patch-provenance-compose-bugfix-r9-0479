@@ -69,7 +69,16 @@ def apply_patch(
 
     # 先在内存中完成全部核对，任何失败都不会触及目标
     result = build_target(baseline, patch_data)
+    write_atomic(target_path, result)
+    _ = max_size  # 大小上限由 CLI 读文件时统一执行
 
+
+def write_atomic(target_path: str, data: bytes) -> None:
+    """同目录临时文件 + fsync + os.replace 原子替换；失败清理临时文件。
+
+    apply 与 compose 共用：只有全部核验通过后的完整字节才允许落盘，
+    任何失败都保留原目标、不留候选残档。
+    """
     target_dir = os.path.dirname(os.path.abspath(target_path))
     tmp_path = None
     try:
@@ -77,7 +86,7 @@ def apply_patch(
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         fd, tmp_path = _mkstemp_in_dir(target_dir, flags)
         with os.fdopen(fd, "wb") as f:
-            f.write(result)
+            f.write(data)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, target_path)
@@ -91,7 +100,6 @@ def apply_patch(
                 os.unlink(tmp_path)
             except OSError:
                 pass
-    _ = max_size  # 大小上限由 CLI 读文件时统一执行
 
 
 def _mkstemp_in_dir(directory: str, flags: int):

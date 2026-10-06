@@ -17,6 +17,7 @@ sys.path.insert(0, ROOT)
 
 from rdiff import BLOCK_SIZE, MAX_FILE_SIZE
 from rdiff.apply import ApplyError, build_target
+from rdiff.compose import ComposeError, compose
 from rdiff.delta import make_delta
 from rdiff.patch import (
     OP_COPY,
@@ -418,6 +419,265 @@ class FailureAtomicityTest(unittest.TestCase):
         lying = Patch(good.target_length, good.base_digest, b"\x00" * 32, good.ops)
         with self.assertRaises(ApplyError):
             build_target(self.baseline, serialize_patch(lying))
+
+
+# ---------- 补丁合并：A->B 与 B->C 合成 A->C ----------
+
+
+def digest(data: bytes) -> bytes:
+    return hashlib.sha256(data).digest()
+
+
+def patch_bytes(baseline, new):
+    return serialize_patch(make_delta(make_signature(baseline), new))
+
+
+def compose_pipeline(testcase, a, b, c):
+    """完整链：A->B、B->C 各出补丁，合并后应用到 A，逐字节复验得到 C。"""
+    wd = Workdir()
+    wd.write("A", a)
+    wd.write("B", b)
+    wd.write("C", c)
+    steps = [
+        run_cli("signature", wd.path("A"), wd.path("sigA")),
+        run_cli("delta", wd.path("sigA"), wd.path("B"), wd.path("p1")),
+        run_cli("signature", wd.path("B"), wd.path("sigB")),
+        run_cli("delta", wd.path("sigB"), wd.path("C"), wd.path("p2")),
+        run_cli("compose", wd.path("p1"), wd.path("p2"), wd.path("combined")),
+        run_cli("apply", wd.path("A"), wd.path("combined"), wd.path("out")),
+    ]
+    testcase.assertEqual(
+        [r.returncode for r in steps],
+        [0] * 6,
+        msg="".join(r.stderr for r in steps),
+    )
+    out = wd.read("out")
+    # 逐字节复验：最终内容、长度、摘要都对应最后目标
+    testcase.assertEqual(out, c)
+    testcase.assertEqual(len(out), len(c))
+    testcase.assertEqual(hashlib.sha256(out).digest(), hashlib.sha256(c).digest())
+    combined_raw = wd.read("combined")
+    combined = parse_patch(combined_raw)
+    testcase.assertEqual(combined.target_length, len(c))
+    testcase.assertEqual(combined.target_digest, digest(c))
+    testcase.assertEqual(combined.base_digest, digest(a))
+    # 合并输出是规范的版本 1 格式：解析后再序列化逐字节一致
+    testcase.assertEqual(serialize_patch(combined), combined_raw)
+    assert_ops_well_formed(testcase, combined.ops, len(c))
+    return wd, combined
+
+
+def compose_expect_failure(testcase, p1, p2):
+    """合并必须整次拒绝：非零退出、保留已有输出、不留临时残档。"""
+    wd = Workdir()
+    wd.write("p1", p1)
+    wd.write("p2", p2)
+    sentinel = b"PREVIOUS COMBINED OUTPUT - must survive failure"
+    wd.write("combined", sentinel)
+    r = run_cli("compose", wd.path("p1"), wd.path("p2"), wd.path("combined"))
+    testcase.assertNotEqual(r.returncode, 0)
+    testcase.assertEqual(wd.read("combined"), sentinel)
+    testcase.assertEqual(wd.leftovers(), [])
+    # 输出本不存在时，失败也不得凭空创建
+    r2 = run_cli("compose", wd.path("p1"), wd.path("p2"), wd.path("combined2"))
+    testcase.assertNotEqual(r2.returncode, 0)
+    testcase.assertFalse(wd.exists("combined2"))
+    testcase.assertEqual(wd.leftovers(), [])
+    return r
+
+
+class ComposeTest(unittest.TestCase):
+    def test_chain_with_moves_insertions_and_tail(self):
+        x, y, z = block(1), block(2), block(3)
+        a = x + y + z
+        b = z + y + x  # 块搬移
+        c = b[:100] + b"INSERT" + b[100:] + block(9, 88)  # 插入 + 短尾新增
+        compose_pipeline(self, a, b, c)
+
+    def test_second_copy_spanning_multiple_segments(self):
+        # 后补丁一条 COPY 横跨前补丁的 COPY / LITERAL / COPY 三段
+        a = block(1) + block(2)
+        b = a[:256] + b"XY" + a[256:]
+        first = Patch(
+            len(b),
+            digest(a),
+            digest(b),
+            [op_copy(0, 256), op_literal(b"XY"), op_copy(256, 256)],
+        )
+        second = Patch(len(b), digest(b), digest(b), [op_copy(0, len(b))])
+        combined = compose(first, second)
+        self.assertEqual(
+            combined.ops, [op_copy(0, 256), op_literal(b"XY"), op_copy(256, 256)]
+        )
+        self.assertEqual(build_target(a, serialize_patch(combined)), b)
+
+    def test_second_selects_range_with_new_bytes(self):
+        # 后补丁选取的区间包含前补丁引入的新增字节（LITERAL）
+        a = block(1)
+        b = a + b"brand-new-bytes"
+        c = b"brand-new-bytes" + a  # 新增段被搬到最前
+        _, combined = compose_pipeline(self, a, b, c)
+        self.assertEqual(combined.ops[0], op_literal(b"brand-new-bytes"))
+        self.assertEqual(combined.ops[1], op_copy(0, 256))
+
+    def test_block_move_chain(self):
+        x, y, z = block(1), block(2), block(3)
+        _, combined = compose_pipeline(self, x + y + z, z + y + x, y + x + z)
+        # 全部 COPY 且只引用最初基线 A 的源偏移
+        self.assertTrue(all(op.kind == OP_COPY for op in combined.ops))
+        self.assertEqual([op.a for op in combined.ops], [256, 0, 512])
+
+    def test_empty_chains(self):
+        compose_pipeline(self, b"", b"", b"")
+        compose_pipeline(self, block(1), b"", b"")
+        compose_pipeline(self, b"", block(7), block(8))
+        compose_pipeline(self, block(1), block(2), b"")
+        compose_pipeline(self, b"", b"", block(5, 88))
+
+    def test_short_tail_blocks(self):
+        for tail_len in (1, 88, 255):
+            tail = block(5, tail_len)
+            a = block(1) + block(2) + tail
+            b = tail + block(1) + block(2)  # 短尾块搬到最前
+            c = block(2) + tail + block(1)  # 再搬一次
+            compose_pipeline(self, a, b, c)
+
+    def test_random_chain(self):
+        import random
+
+        rng = random.Random(99)
+        a = bytes(rng.randrange(256) for _ in range(3000))
+        b = bytearray(a)
+        b[500:900] = rng.randbytes(400)  # 中段替换
+        b = bytes(b) + rng.randbytes(133)  # 尾部追加
+        c = b[1000:] + b[:1000]  # 大幅搬移
+        compose_pipeline(self, a, b, c)
+
+    def test_compose_reads_only_the_two_patches(self):
+        a, b, c = block(1), block(2) + block(3), block(4)
+        wd = Workdir()
+        wd.write("A", a)
+        wd.write("B", b)
+        wd.write("C", c)
+        for args in (
+            ("signature", wd.path("A"), wd.path("sigA")),
+            ("delta", wd.path("sigA"), wd.path("B"), wd.path("p1")),
+            ("signature", wd.path("B"), wd.path("sigB")),
+            ("delta", wd.path("sigB"), wd.path("C"), wd.path("p2")),
+        ):
+            self.assertEqual(run_cli(*args).returncode, 0)
+        # 删除全部正文与签名后合并仍成功：合并只读两份补丁
+        for name in ("A", "B", "C", "sigA", "sigB"):
+            os.remove(wd.path(name))
+        r = run_cli("compose", wd.path("p1"), wd.path("p2"), wd.path("combined"))
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        wd.write("A", a)  # 接收方只持有旧文件
+        r = run_cli("apply", wd.path("A"), wd.path("combined"), wd.path("out"))
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        self.assertEqual(wd.read("out"), c)
+
+    def test_adjacent_copies_merged_when_contiguous(self):
+        a = block(1)
+        first = Patch(
+            256, digest(a), digest(a), [op_copy(0, 100), op_copy(100, 156)]
+        )
+        # B[50:200) -> A[50:100) 与 A[100:200)，基线连续应合并为一条
+        second = Patch(150, digest(a), digest(a[50:200]), [op_copy(50, 150)])
+        combined = compose(first, second)
+        self.assertEqual(combined.ops, [op_copy(50, 150)])
+        self.assertEqual(build_target(a, serialize_patch(combined)), a[50:200])
+
+    def test_adjacent_literals_merged(self):
+        a = block(1)
+        b = b"foobar"
+        first = Patch(6, digest(a), digest(b), [op_literal(b"foo"), op_literal(b"bar")])
+        second = Patch(6, digest(b), digest(b), [op_copy(0, 6)])
+        combined = compose(first, second)
+        self.assertEqual(combined.ops, [op_literal(b"foobar")])
+        self.assertEqual(build_target(a, serialize_patch(combined)), b)
+
+    def test_handmade_long_copy_is_split(self):
+        a = block(1) + block(2)
+        b = a[:300]
+        first = Patch(300, digest(a), digest(b), [op_copy(0, 300)])  # 格式允许 u16
+        second = Patch(300, digest(b), digest(b), [op_copy(0, 300)])
+        combined = compose(first, second)
+        self.assertEqual(combined.ops, [op_copy(0, 256), op_copy(256, 44)])
+        self.assertEqual(build_target(a, serialize_patch(combined)), b)
+
+    def test_chain_digest_mismatch_rejected(self):
+        p1 = patch_bytes(block(1), block(2))
+        p2 = patch_bytes(block(9), block(3))  # 另一条链：中间摘要不同
+        r = compose_expect_failure(self, p1, p2)
+        self.assertIn("链摘要", r.stderr)
+
+    def test_second_copy_out_of_bounds_rejected(self):
+        a, b = block(1), block(2)
+        p1 = patch_bytes(a, b)  # B 长 256
+        second = Patch(10, digest(b), digest(b"0123456789"), [op_copy(250, 10)])
+        r = compose_expect_failure(self, p1, serialize_patch(second))
+        self.assertIn("越界", r.stderr)
+        # 恰好到边界的引用合法
+        ok = Patch(10, digest(b), digest(b[246:256]), [op_copy(246, 10)])
+        combined = compose(parse_patch(p1), ok)
+        self.assertEqual(build_target(a, serialize_patch(combined)), b[246:256])
+
+    def test_corrupt_instructions_rejected(self):
+        a, b, c = block(1), block(2), block(3)
+        p1 = patch_bytes(a, b)
+        p2 = patch_bytes(b, c)
+        opcode_at = 5 + 1 + 4 + 32 + 32  # 头部之后第一条指令的 opcode
+        for bad_first, bad_second in (
+            (p1[: len(p1) // 2], p2),  # 前补丁截断
+            (p1, p2[: len(p2) - 3]),  # 后补丁截断
+            (p1, p2 + b"\x00"),  # END 后垃圾
+            (p1, p2[:opcode_at] + b"\x7e" + p2[opcode_at + 1 :]),  # 未知 opcode
+        ):
+            compose_expect_failure(self, bad_first, bad_second)
+
+    def test_overlimit_result_rejected(self):
+        # 前补丁手工 COPY 偏移贴近 u32 上限，映射结果偏移超出格式上限
+        a = block(1)
+        b = block(2, 100)
+        first = Patch(100, digest(a), digest(b), [op_copy(0xFFFFFFFF, 100)])
+        second = Patch(50, digest(b), digest(b[40:90]), [op_copy(40, 50)])
+        r = compose_expect_failure(self, serialize_patch(first), serialize_patch(second))
+        self.assertIn("上限", r.stderr)
+
+    def test_compose_unit_rejects(self):
+        first = parse_patch(patch_bytes(block(1), block(2)))
+        with self.assertRaises(ComposeError):  # 链摘要断裂
+            compose(first, parse_patch(patch_bytes(block(3), block(4))))
+        oob = Patch(10, digest(block(2)), digest(b"0123456789"), [op_copy(250, 10)])
+        with self.assertRaises(ComposeError):  # 后补丁越界引用
+            compose(first, oob)
+
+    def test_structure_ok_but_lying_digest_caught_by_apply(self):
+        # 合并只做结构验证：结构合法但目标摘要撒谎的补丁能合并，
+        # 最终 apply 的内容核验必须拒绝并保留原目标——两者不互相冒充
+        a, b = block(1), block(2)
+        wd = Workdir()
+        wd.write("p1", patch_bytes(a, b))
+        lying = Patch(5, digest(b), digest(b"world"), [op_literal(b"hello")])
+        wd.write("p2", serialize_patch(lying))
+        r = run_cli("compose", wd.path("p1"), wd.path("p2"), wd.path("combined"))
+        self.assertEqual(r.returncode, 0, msg=r.stderr)  # 结构合法：合并通过
+        wd.write("A", a)
+        wd.write("out", b"ORIGINAL")
+        r = run_cli("apply", wd.path("A"), wd.path("combined"), wd.path("out"))
+        self.assertNotEqual(r.returncode, 0)  # 内容核验：apply 拒绝
+        self.assertEqual(wd.read("out"), b"ORIGINAL")
+        self.assertEqual(wd.leftovers(), [])
+
+    def test_composed_patch_still_verifies_baseline(self):
+        # 合并不代替 apply 核验基线：基线被掉包时 apply 必须拒绝
+        a, b, c = block(1), block(2), block(3)
+        wd, _ = compose_pipeline(self, a, b, c)
+        wd.write("other", a + b"tampered")
+        r = run_cli("apply", wd.path("other"), wd.path("combined"), wd.path("out2"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(wd.exists("out2"))
+        self.assertEqual(wd.leftovers(), [])
 
 
 if __name__ == "__main__":

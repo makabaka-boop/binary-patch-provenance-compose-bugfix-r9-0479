@@ -4,9 +4,9 @@ import argparse
 import sys
 
 from . import MAX_FILE_SIZE
-from .apply import ApplyError, apply_patch
+from .apply import ApplyError, apply_patch, write_atomic
 from .delta import make_delta
-from .compose import compose
+from .compose import ComposeError, compose
 from .patch import serialize_patch, parse_patch  # noqa: F401  (parse 供测试/校验)
 from .signature import make_signature, parse_signature, serialize_sig
 from .wire import FormatError
@@ -50,10 +50,15 @@ def cmd_apply(args) -> None:
 
 
 def cmd_compose(args):
-    first = parse_patch(read_limited(args.first, MAX_FILE_SIZE * 4, "前补丁"))
-    second = parse_patch(read_limited(args.second, MAX_FILE_SIZE * 4, "后补丁"))
-    with open(args.output, "wb") as f:
-        f.write(serialize_patch(compose(first, second)))
+    try:
+        first = parse_patch(read_limited(args.first, MAX_FILE_SIZE * 4, "前补丁"))
+        second = parse_patch(read_limited(args.second, MAX_FILE_SIZE * 4, "后补丁"))
+    except FormatError as exc:
+        raise InputError(f"补丁非法: {exc}") from exc
+    # 合并与序列化全部完成（结构校验通过）后才允许落盘；
+    # 原子替换保证任何失败都保留已有输出
+    data = serialize_patch(compose(first, second))
+    write_atomic(args.output, data)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -88,7 +93,7 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
         args.func(args)
-    except (InputError, ApplyError, FormatError, FileNotFoundError, OSError) as exc:
+    except (InputError, ApplyError, ComposeError, FormatError, FileNotFoundError, OSError) as exc:
         print(f"rdiff: {exc}", file=sys.stderr)
         return 1
     return 0

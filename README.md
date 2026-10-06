@@ -20,13 +20,14 @@ rdiff/                 工具实现（无第三方依赖）
   signature.py         分块、签名生成与解析（版本化二进制格式）
   delta.py             滑窗匹配：弱命中 -> 强摘要核对 -> 最长/最小偏移
   patch.py             补丁格式与 COPY / LITERAL 指令
+  compose.py           相邻补丁合并：后补丁的 B 区间透过前补丁映射回最初基线
   apply.py             冻结基线、内存校验、原子替换、失败清理
   cli.py / __main__.py 命令行入口
 compose.yaml           signature / delta / apply 三个服务
 Dockerfile             python:3.11-slim，只读根文件系统
 scripts/make_sample.py 生成块搬移+插入+短尾的样本
 scripts/run_example.sh 本地或 compose 端到端跑通并逐字节比对
-tests/test_rdiff.py    27 个用例（unittest，无需安装依赖）
+tests/test_rdiff.py    45 个用例（unittest，无需安装依赖）
 data/  work/           演示流水线的挂载目录（git 忽略内容）
 ```
 
@@ -135,6 +136,11 @@ b' = b - n·out + a' - n
 - **失败原子性**：篡改负载、多点截断、END 后垃圾、坏 magic/版本、越界 COPY、
   边界 COPY、基线摘要不符、目标长度撒谎、目标目录缺失、基线被掉包——
   原目标内容保持不变，且无临时候选文件残留。
+- **补丁合并**：块搬移链、插入+短尾、后补丁 COPY 横跨前补丁多段、选取区间
+  含新增字节、空文件链、短尾块链、随机链——合并结果逐字节还原最终目标，
+  相邻字面量合并、COPY 每条 ≤256、序列化逐字节往返；链摘要断裂、后补丁
+  越界引用、损坏指令、结果超限（偏移超 u32）整次拒绝且保留已有合并输出；
+  结构合法但摘要撒谎的合并结果由 apply 内容核验最终否决。
 
 
 ## 补丁合并
