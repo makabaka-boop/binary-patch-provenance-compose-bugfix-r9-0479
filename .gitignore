@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+/work/
+/data/in/
+/data/new/
+/data/out/
+.rdiff-apply-*.tmp
+
+node_modules/
+dist/
+__pycache__/
+*.pyc
+*.db
+.pytest_cache/
+*.tsbuildinfo
