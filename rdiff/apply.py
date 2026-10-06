@@ -59,6 +59,34 @@ def build_target(baseline: bytes, patch_data: bytes) -> bytes:
     return result
 
 
+def atomic_write(path: str, data: bytes, prefix: str = ".rdiff-apply-") -> None:
+    """同目录 O_EXCL 候选文件 + fsync + os.replace 原子落盘。
+
+    任何失败都删除候选文件、保留既有目标（不存在也不新建）。
+    apply 与 compose 共用同一套“先算完、后落盘”的失败语义。
+    """
+    target_dir = os.path.dirname(os.path.abspath(path))
+    tmp_path = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        fd, tmp_path = _mkstemp_in_dir(target_dir, flags, prefix)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+    except OSError as exc:
+        raise OSError(f"写入目标失败: {exc}") from exc
+    finally:
+        # 失败路径：候选绝不残留
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 def apply_patch(
     baseline_path: str, patch_path: str, target_path: str, max_size: int
 ) -> None:
@@ -69,40 +97,19 @@ def apply_patch(
 
     # 先在内存中完成全部核对，任何失败都不会触及目标
     result = build_target(baseline, patch_data)
-
-    target_dir = os.path.dirname(os.path.abspath(target_path))
-    tmp_path = None
-    try:
-        # 同目录临时文件保证 rename 是原子替换
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        fd, tmp_path = _mkstemp_in_dir(target_dir, flags)
-        with os.fdopen(fd, "wb") as f:
-            f.write(result)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, target_path)
-        tmp_path = None
-    except OSError as exc:
-        raise ApplyError(f"写入目标失败: {exc}") from exc
-    finally:
-        # 失败路径：候选绝不残留
-        if tmp_path is not None:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+    atomic_write(target_path, result)
     _ = max_size  # 大小上限由 CLI 读文件时统一执行
 
 
-def _mkstemp_in_dir(directory: str, flags: int):
+def _mkstemp_in_dir(directory: str, flags: int, prefix: str = ".rdiff-apply-"):
     import random
     import time
 
     for _ in range(100):
-        name = f".rdiff-apply-{os.getpid()}-{time.time_ns()}-{random.randrange(1 << 32):08x}.tmp"
+        name = f"{prefix}{os.getpid()}-{time.time_ns()}-{random.randrange(1 << 32):08x}.tmp"
         path = os.path.join(directory, name)
         try:
             return os.open(path, flags, 0o644), path
         except FileExistsError:
             continue
-    raise ApplyError("无法创建临时候选文件")
+    raise OSError("无法创建临时候选文件")

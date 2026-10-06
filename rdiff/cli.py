@@ -4,9 +4,9 @@ import argparse
 import sys
 
 from . import MAX_FILE_SIZE
-from .apply import ApplyError, apply_patch
+from .apply import ApplyError, apply_patch, atomic_write
 from .delta import make_delta
-from .compose import compose
+from .compose import ComposeError, compose
 from .patch import serialize_patch, parse_patch  # noqa: F401  (parse 供测试/校验)
 from .signature import make_signature, parse_signature, serialize_sig
 from .wire import FormatError
@@ -52,8 +52,10 @@ def cmd_apply(args) -> None:
 def cmd_compose(args):
     first = parse_patch(read_limited(args.first, MAX_FILE_SIZE * 4, "前补丁"))
     second = parse_patch(read_limited(args.second, MAX_FILE_SIZE * 4, "后补丁"))
-    with open(args.output, "wb") as f:
-        f.write(serialize_patch(compose(first, second)))
+    # 全部结构合并在内存中完成；任何拒绝都发生在触碰输出之前，
+    # 再以同目录候选 + os.replace 原子落盘，失败保留既有输出。
+    combined = serialize_patch(compose(first, second))
+    atomic_write(args.output, combined, prefix=".rdiff-compose-")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -88,7 +90,14 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
         args.func(args)
-    except (InputError, ApplyError, FormatError, FileNotFoundError, OSError) as exc:
+    except (
+        InputError,
+        ApplyError,
+        ComposeError,
+        FormatError,
+        FileNotFoundError,
+        OSError,
+    ) as exc:
         print(f"rdiff: {exc}", file=sys.stderr)
         return 1
     return 0
